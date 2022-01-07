@@ -1,0 +1,238 @@
+Description: "Amazon Managed Blockchain Hyperledger"
+Parameters:
+  MemberName:
+    Type: String
+  MemberAdminUsername:
+    Type: String
+  MemberAdminPassword:
+    Type: String
+    NoEcho: true
+  NetworkName:
+    Type: String
+  Edition:
+    Type: String
+    Default: STARTER
+    AllowedValues:
+      - STARTER
+      - STANDARD
+  ThresholdPercentage:
+    Type: Number
+    Default: 50
+  ThresholdComparator:
+    Type: String
+    Default: GREATER_THAN_OR_EQUAL_TO
+    AllowedValues:
+      - GREATER_THAN
+      - GREATER_THAN_OR_EQUAL_TO
+  ProposalDurationInHours:
+    Type: Number
+    Default: 1
+  InstanceType:
+    Type: String
+    Default: bc.t3.small
+    AllowedValues:
+      - bc.t3.small
+      - bc.t3.medium
+      - bc.t3.large
+      - bc.t3.xlarge
+      - bc.m5.large
+      - bc.m5.xlarge
+      - bc.m5.2xlarge
+      - bc.m5.4xlarge
+      - bc.c5.large
+      - bc.c5.xlarge
+      - bc.c5.2xlarge
+      - bc.c5.4xlarge 
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: ""
+  Subnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: ""
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: for Network
+        Parameters:
+          - NetworkName
+          - Edition
+          - ThresholdPercentage
+          - ProposalDurationInHours
+          - ThresholdComparator
+      - Label:
+          default: for Member
+        Parameters:
+          - MemberName
+          - MemberAdminUsername
+          - MemberAdminPassword
+      - Label:
+          default: for Init Peer Node
+        Parameters:
+          - InstanceType
+          
+Resources:
+  NetworkAndInitialMember:
+    Type: "AWS::ManagedBlockchain::Member"
+    Properties:
+      NetworkConfiguration:
+        Name: !Ref NetworkName
+        Framework: "HYPERLEDGER_FABRIC"
+        FrameworkVersion: "2.2"
+        NetworkFrameworkConfiguration:
+          NetworkFabricConfiguration:
+            Edition: !Ref Edition
+        VotingPolicy:
+          ApprovalThresholdPolicy:
+            ThresholdPercentage: !Ref ThresholdPercentage
+            ProposalDurationInHours: !Ref ProposalDurationInHours
+            ThresholdComparator: !Ref ThresholdComparator
+      MemberConfiguration:
+        Name: !Ref MemberName
+        MemberFrameworkConfiguration:
+          MemberFabricConfiguration:
+            AdminUsername: !Ref MemberAdminUsername
+            AdminPassword: !Ref MemberAdminPassword
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+      CidrBlock: !Ref Subnet1Cidr
+      VpcId: !Ref VPC
+
+  ManagedBlockchainVpcEndpoint:
+    Type: AWS::CloudFormation::CustomResource
+    Properties: 
+      ServiceToken: !GetAtt ManagedBlockchainVpcEndpointLambda.Arn
+      NetworkId: !GetAtt NetworkAndInitialMember.NetworkId
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref Subnet1
+      SecurityGroupIds:
+        - !Ref FabricSecurityGroup
+  
+  FabricSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "FabricSecurityGroup"
+      GroupName: FabricSecurityGroup
+      VpcId: !Ref VPC
+
+  FabricSecurityIngressOwn:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref FabricSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30000
+      ToPort: 34000
+      SourceSecurityGroupId: !Ref FabricSecurityGroup
+
+  InitialNode:
+    Type: "AWS::ManagedBlockchain::Node"
+    Properties:
+      NetworkId: !GetAtt NetworkAndInitialMember.NetworkId
+      MemberId: !GetAtt NetworkAndInitialMember.MemberId
+      NodeConfiguration:
+        InstanceType: !Ref InstanceType
+        AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+
+  ManagedBlockchainVpcEndpointLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+            try:
+              print(event)
+              params = dict([(k, v) for k, v in event['ResourceProperties'].items() if k != 'ServiceToken'])
+              amb = boto3.client('managedblockchain')
+              response = amb.get_network(
+                NetworkId=event['ResourceProperties']['NetworkId']
+              )
+              vpc_endpoint_service_name = response['Network']['VpcEndpointServiceName']
+
+              client = boto3.client('ec2')
+              if event['RequestType'] == 'Create':
+                response = client.create_vpc_endpoint(
+                  VpcEndpointType='Interface',
+                  VpcId=event['ResourceProperties']['VpcId'],
+                  ServiceName=vpc_endpoint_service_name,
+                  SubnetIds=event['ResourceProperties']['SubnetIds'],
+                  SecurityGroupIds=event['ResourceProperties']['SecurityGroupIds'],
+                  PrivateDnsEnabled=True
+                )
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'ManagedBlockchainVpcEndpointLambda')
+              if event['RequestType'] == 'Delete':
+                response = client.describe_vpc_endpoints(
+                  Filters=[
+                    {
+                      'Name': 'service-name',
+                      'Values': [ vpc_endpoint_service_name ]
+                    },
+                  ],
+                )
+                response = client.delete_vpc_endpoints(
+                  VpcEndpointIds=[
+                      response['VpcEndpoints'][0]['VpcEndpointId'],
+                  ]
+                )
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'ManagedBlockchainVpcEndpointLambda')
+              if event['RequestType'] == 'Update':
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, 'ManagedBlockchainVpcEndpointLambda')
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, 'ManagedBlockchainVpcEndpointLambda')
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecuteRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+
+  LambdaExecuteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambdarole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-VpcEndpointCreatePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DeleteVpcEndpoints'
+                  - 'ec2:CreateVpcEndpoint'
+                  - 'ec2:DescribeVpcEndpoints'
+                  - 'managedblockchain:GetNetwork'
+                Resource: '*'
+
+Outputs:
+  NetworkId:
+    Value: !GetAtt NetworkAndInitialMember.NetworkId
+  InitialMemberId:
+    Value: !GetAtt NetworkAndInitialMember.MemberId
+  NodeId:
+    Value: !GetAtt InitialNode.NodeId
